@@ -694,94 +694,62 @@ function Get-PostCallBranchDirection([byte[]]$Data,[int]$CallOffset) {
     $null
 }
 
-function Get-PeTextSection([byte[]]$Data) {
-    if ($Data.Length -lt 0x100) {
-        throw 'PE image is too small.'
-    }
+function Get-OutputPointerSetup([byte[]]$Data,[int]$IidLeaOffset) {
+    # Immediately before the IID setup Maple materializes the original
+    # ppvAdapter pointer in RDX and stores it in the fifth-argument stack slot:
+    #
+    #   lea rdx,[rsp+disp]
+    #   mov [rsp+20h],rdx
+    #
+    # The exact local stack displacement can vary by build. Detect both disp8
+    # and disp32 LEA encodings and return the semantic layout.
+    $searchStart = [Math]::Max(0,$IidLeaOffset - 32)
 
-    $peOffset = [BitConverter]::ToInt32($Data,0x3C)
-    if (
-        $peOffset -lt 0 -or
-        ($peOffset + 24) -ge $Data.Length -or
-        $Data[$peOffset] -ne 0x50 -or
-        $Data[$peOffset + 1] -ne 0x45 -or
-        $Data[$peOffset + 2] -ne 0x00 -or
-        $Data[$peOffset + 3] -ne 0x00
-    ) {
-        throw 'Invalid PE header.'
-    }
-
-    $sectionCount = [BitConverter]::ToUInt16($Data,$peOffset + 6)
-    $optionalHeaderSize = [BitConverter]::ToUInt16($Data,$peOffset + 20)
-    $sectionTable = $peOffset + 24 + $optionalHeaderSize
-
-    for ($i = 0; $i -lt $sectionCount; $i++) {
-        $s = $sectionTable + ($i * 40)
-        if (($s + 40) -gt $Data.Length) {
-            break
-        }
-
-        $name = [Text.Encoding]::ASCII.GetString($Data,$s,8).Trim([char]0)
-        if ($name -ne '.text') {
+    for ($store = $IidLeaOffset - 5; $store -ge $searchStart; $store--) {
+        if (
+            $Data[$store] -ne 0x48 -or
+            $Data[$store + 1] -ne 0x89 -or
+            $Data[$store + 2] -ne 0x54 -or
+            $Data[$store + 3] -ne 0x24 -or
+            $Data[$store + 4] -ne 0x20
+        ) {
             continue
         }
 
-        $virtualSize = [BitConverter]::ToUInt32($Data,$s + 8)
-        $rawSize = [BitConverter]::ToUInt32($Data,$s + 16)
-        $rawPointer = [BitConverter]::ToUInt32($Data,$s + 20)
-
-        $usable = [int64]$rawSize
-        if ($virtualSize -gt 0 -and [int64]$virtualSize -lt $usable) {
-            $usable = [int64]$virtualSize
-        }
-
-        if (
-            $rawPointer -ge $Data.Length -or
-            ([int64]$rawPointer + $usable) -gt $Data.Length -or
-            $usable -lt 1
-        ) {
-            throw 'Invalid .text section bounds.'
-        }
-
-        return [pscustomobject]@{
-            RawOffset = [int]$rawPointer
-            Length = [int]$usable
-        }
-    }
-
-    throw '.text section not found.'
-}
-
-function Find-CodeCave([byte[]]$Data,[int]$Length) {
-    $text = Get-PeTextSection -Data $Data
-    $start = [int]$text.RawOffset
-    $end = $start + [int]$text.Length
-
-    $runStart = -1
-    $runLength = 0
-    $last = -1
-
-    for ($i = $start; $i -lt $end; $i++) {
-        if ($Data[$i] -eq 0xCC) {
-            if ($runLength -eq 0) {
-                $runStart = $i
-            }
-            $runLength++
-            if ($runLength -ge $Length) {
-                $last = $runStart
+        if ($store -ge 5) {
+            $s = $store - 5
+            if (
+                $Data[$s] -eq 0x48 -and
+                $Data[$s + 1] -eq 0x8D -and
+                $Data[$s + 2] -eq 0x54 -and
+                $Data[$s + 3] -eq 0x24
+            ) {
+                return [pscustomobject]@{
+                    StartOffset = $s
+                    LeaLength = 5
+                    StackDisplacement = [int][byte]$Data[$s + 4]
+                }
             }
         }
-        else {
-            $runStart = -1
-            $runLength = 0
+
+        if ($store -ge 8) {
+            $s = $store - 8
+            if (
+                $Data[$s] -eq 0x48 -and
+                $Data[$s + 1] -eq 0x8D -and
+                $Data[$s + 2] -eq 0x94 -and
+                $Data[$s + 3] -eq 0x24
+            ) {
+                return [pscustomobject]@{
+                    StartOffset = $s
+                    LeaLength = 8
+                    StackDisplacement = [BitConverter]::ToInt32($Data,$s + 4)
+                }
+            }
         }
     }
 
-    if ($last -lt 0) {
-        throw "No executable 0xCC code cave of at least $Length bytes was found in .text."
-    }
-
-    [int]$last
+    $null
 }
 
 function Find-EnumAdapterByGpuPreferenceSites([byte[]]$Data,[string]$DllHash) {
@@ -824,10 +792,19 @@ function Find-EnumAdapterByGpuPreferenceSites([byte[]]$Data,[string]$DllHash) {
                 } |
                 Sort-Object CallOffset
         )) {
+            $output = Get-OutputPointerSetup -Data $Data -IidLeaOffset $first.IidLeaOffset
+            if (-not $output) {
+                continue
+            }
+
             $pairs.Add([pscustomobject]@{
                 FirstCallOffset = [int]$first.CallOffset
                 LoopCallOffset = [int]$loop.CallOffset
+                IidLeaOffset = [int]$first.IidLeaOffset
                 IidTargetKey = [int64]$first.IidTargetKey
+                SetupStartOffset = [int]$output.StartOffset
+                OutputLeaLength = [int]$output.LeaLength
+                OutputStackDisplacement = [int]$output.StackDisplacement
             })
             break
         }
@@ -845,8 +822,8 @@ function Bytes-ToHex([byte[]]$Bytes) {
 }
 
 function Build-DllPatchPlan([string]$DllPath,[object]$Adapter) {
-    if ($Adapter.DxgiIndex -lt 0 -or $Adapter.DxgiIndex -gt 127) {
-        throw "DXGI index $($Adapter.DxgiIndex) is outside the supported 0..127 test-build range."
+    if ($null -eq $Adapter.AdapterLuid) {
+        throw "Selected adapter '$($Adapter.Name)' does not expose an AdapterLuid."
     }
 
     $sig = Get-AuthenticodeSignature -LiteralPath $DllPath
@@ -857,63 +834,76 @@ function Build-DllPatchPlan([string]$DllPath,[object]$Adapter) {
     $data = [IO.File]::ReadAllBytes($DllPath)
     $originalHash = Hash $DllPath
     $sites = Find-EnumAdapterByGpuPreferenceSites -Data $data -DllHash $originalHash
-    $selectedIndex = [byte]$Adapter.DxgiIndex
+    $selectedLuid = [uint64]$Adapter.AdapterLuid
+    $luidBytes = [BitConverter]::GetBytes($selectedLuid)
 
-    # Do not depend on the compiler's exact argument-setup instructions.
-    # Redirect only the first six-byte COM call to a tiny in-.text trampoline.
-    # CALL pushes the original return address; the trampoline rewrites RDX/R8D
-    # and tail-jumps to the original vtable method. The DXGI method returns
-    # directly to the byte after our CALL, preserving the original call shape.
-    $stub = [byte[]](
-        0x6A,$selectedIndex,       # push AdapterIndex (0..127)
-        0x5A,                      # pop rdx
-        0x45,0x33,0xC0,           # xor r8d,r8d (UNSPECIFIED)
-        0xFF,0xA0,0xE8,0x00,0x00,0x00 # jmp qword ptr [rax+E8]
-    )
+    # Rewrite the whole first-call argument setup instead of depending on the
+    # compiler's exact AdapterIndex/GpuPreference instructions.
+    #
+    # IDXGIFactory4::EnumAdapterByLuid:
+    #   RCX = factory               (already live)
+    #   RDX = exact AdapterLuid
+    #   R8  = REFIID
+    #   R9  = ppvAdapter
+    #
+    # We reconstruct R9 from Maple's detected stack-local output pointer and R8
+    # from the same IID constant used by the original EnumAdapterByGpuPreference.
+    $replacement = [System.Collections.Generic.List[byte]]::new()
 
-    $caveOffset = Find-CodeCave -Data $data -Length $stub.Length
-    if (
-        ($caveOffset -ge $sites.FirstCallOffset -and $caveOffset -lt ($sites.FirstCallOffset + 6)) -or
-        ($caveOffset -ge $sites.LoopCallOffset -and $caveOffset -lt ($sites.LoopCallOffset + 6))
-    ) {
-        throw 'Selected code cave overlaps an adapter-selection call site.'
+    if ($sites.OutputLeaLength -eq 5) {
+        foreach ($b in [byte[]](0x4C,0x8D,0x4C,0x24,[byte]($sites.OutputStackDisplacement -band 0xFF))) {
+            $replacement.Add($b)
+        }
+    }
+    elseif ($sites.OutputLeaLength -eq 8) {
+        foreach ($b in [byte[]](0x4C,0x8D,0x8C,0x24)) { $replacement.Add($b) }
+        foreach ($b in [BitConverter]::GetBytes([int32]$sites.OutputStackDisplacement)) { $replacement.Add($b) }
+    }
+    else {
+        throw "Unsupported ppvAdapter LEA length: $($sites.OutputLeaLength)"
     }
 
-    $rel64 = [int64]$caveOffset - ([int64]$sites.FirstCallOffset + 5)
-    if ($rel64 -lt [int32]::MinValue -or $rel64 -gt [int32]::MaxValue) {
-        throw 'Selected code cave is outside rel32 CALL range.'
+    $newIidLeaOffset = [int64]$sites.SetupStartOffset + $replacement.Count
+    $iidDisp64 = [int64]$sites.IidTargetKey - ($newIidLeaOffset + 7)
+    if ($iidDisp64 -lt [int32]::MinValue -or $iidDisp64 -gt [int32]::MaxValue) {
+        throw 'IDXGIAdapter IID target is outside RIP-relative range.'
+    }
+    $iidDisp = [BitConverter]::GetBytes([int32]$iidDisp64)
+    foreach ($b in [byte[]](0x4C,0x8D,0x05,$iidDisp[0],$iidDisp[1],$iidDisp[2],$iidDisp[3])) {
+        $replacement.Add($b)
     }
 
-    $rel = [BitConverter]::GetBytes([int32]$rel64)
-    $firstReplacement = [byte[]](
-        0xE8,$rel[0],$rel[1],$rel[2],$rel[3], # call rel32 trampoline
-        0x90                                  # preserve original 6-byte width
-    )
+    foreach ($b in [byte[]](0x48,0xBA)) { $replacement.Add($b) }
+    foreach ($b in $luidBytes) { $replacement.Add($b) }
 
-    # Once Maple has appended the selected adapter, stop the next enumeration
-    # iteration by returning the actual DXGI_ERROR_NOT_FOUND HRESULT in EAX.
-    # Existing post-call control flow exits the loop naturally, leaving only the
-    # selected adapter in the candidate vector.
+    # IDXGIFactory4::EnumAdapterByLuid is vtable slot 26 => 26 * 8 = 0xD0.
+    foreach ($b in [byte[]](0xFF,0x90,0xD0,0x00,0x00,0x00)) { $replacement.Add($b) }
+
+    $firstBlockLength = ($sites.FirstCallOffset + 6) - $sites.SetupStartOffset
+    if ($replacement.Count -gt $firstBlockLength) {
+        throw "Exact-LUID call rewrite needs $($replacement.Count) bytes but detected setup block has only $firstBlockLength bytes."
+    }
+    while ($replacement.Count -lt $firstBlockLength) {
+        $replacement.Add(0x90)
+    }
+    $firstReplacement = [byte[]]$replacement.ToArray()
+
+    # The exact LUID adapter is now the first and only wanted candidate. Stop the
+    # following preference-ordered enumeration loop with DXGI_ERROR_NOT_FOUND.
     $loopReplacement = [byte[]](0xB8,0x02,0x00,0x7A,0x88,0x90)
 
     $patches = @(
         [pscustomobject]@{
-            Name = 'Redirect selected-adapter call through dynamic trampoline'
-            Offset = [int]$sites.FirstCallOffset
-            OriginalBytes = [byte[]]$data[$sites.FirstCallOffset..($sites.FirstCallOffset + 5)]
+            Name = 'Rewrite first adapter selection as EnumAdapterByLuid'
+            Offset = [int]$sites.SetupStartOffset
+            OriginalBytes = [byte[]]$data[$sites.SetupStartOffset..($sites.FirstCallOffset + 5)]
             NewBytes = $firstReplacement
         },
         [pscustomobject]@{
-            Name = 'Stop adapter enumeration after selected adapter'
+            Name = 'Stop preference enumeration after exact-LUID adapter'
             Offset = [int]$sites.LoopCallOffset
             OriginalBytes = [byte[]]$data[$sites.LoopCallOffset..($sites.LoopCallOffset + 5)]
             NewBytes = $loopReplacement
-        },
-        [pscustomobject]@{
-            Name = 'Dynamic adapter-selection trampoline'
-            Offset = [int]$caveOffset
-            OriginalBytes = [byte[]]$data[$caveOffset..($caveOffset + $stub.Length - 1)]
-            NewBytes = $stub
         }
     )
 
@@ -922,10 +912,11 @@ function Build-DllPatchPlan([string]$DllPath,[object]$Adapter) {
         OriginalHash = $originalHash
         SelectedAdapter = $Adapter
         Detector = [pscustomobject]@{
-            Strategy = 'semantic-call-pair + dynamic-code-cave'
+            Strategy = 'semantic-call-pair + inline-EnumAdapterByLuid'
+            SelectedAdapterLuid = ('0x{0:X16}' -f $selectedLuid)
+            SetupStartOffset = ('0x{0:X}' -f $sites.SetupStartOffset)
             FirstCallOffset = ('0x{0:X}' -f $sites.FirstCallOffset)
             LoopCallOffset = ('0x{0:X}' -f $sites.LoopCallOffset)
-            CodeCaveOffset = ('0x{0:X}' -f $caveOffset)
         }
         Patches = $patches
     }
@@ -1204,6 +1195,7 @@ function Invoke-DllAdapterSelectionBackend([string]$MapleStoryPath,[object]$Adap
     $proc = $null
     $mappedPatched = $null
     $canonicalRestored = $false
+    $cleanupStarted = $false
 
     try {
         Apply-DllPatchPlan $plan
@@ -1234,8 +1226,9 @@ function Invoke-DllAdapterSelectionBackend([string]$MapleStoryPath,[object]$Adap
         $canonicalRestored = $true
         Write-Host 'Original signed Gr2D_DX11.dll restored immediately while Maple remains running.' -ForegroundColor Green
 
-        $gpu = Verify-ProcessGpu -Process $proc -Adapter $Adapter
-
+        # Start cleanup protection before GPU verification. If verification fails
+        # after the signed DLL is already restored, leave MapleStory running and
+        # let this watcher remove the mapped-patched residual after normal exit.
         $startTicks = $proc.StartTime.Ticks
         $log = Join-Path $backupDir 'MapleStory_GPU_Seletor_cleanup.log'
         $shell = (Get-Command powershell.exe -ErrorAction SilentlyContinue).Source
@@ -1261,6 +1254,9 @@ function Invoke-DllAdapterSelectionBackend([string]$MapleStoryPath,[object]$Adap
         if ($watch.HasExited) {
             throw 'Cleanup watcher failed to stay running.'
         }
+        $cleanupStarted = $true
+
+        $gpu = Verify-ProcessGpu -Process $proc -Adapter $Adapter
 
         Write-Host (
             "PASS: MapleStory is using '{0}'. DXGI index={1}; dedicated={2:N1} MiB; shared={3:N1} MiB." -f
@@ -1276,18 +1272,28 @@ function Invoke-DllAdapterSelectionBackend([string]$MapleStoryPath,[object]$Adap
     }
     catch {
         $err = $_
+        $procAlive = $proc -and -not $proc.HasExited
 
-        if ($proc -and -not $proc.HasExited) {
+        # Before the canonical DLL is safely restored (or when cleanup protection
+        # failed to start), terminating our own child process is necessary to
+        # release the mapped patched file and recover safely. After restoration
+        # plus watcher startup, verification failure must not kill the game.
+        if ($procAlive -and (-not $canonicalRestored -or -not $cleanupStarted)) {
             Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
             Start-Sleep -Milliseconds 800
+            $procAlive = $false
         }
 
         if (-not $canonicalRestored -or -not (Test-Path -LiteralPath $dll) -or (Hash $dll) -ne $plan.OriginalHash) {
             Copy-Item -LiteralPath $backup -Destination $dll -Force -ErrorAction SilentlyContinue
         }
 
-        if ($mappedPatched -and (Test-Path -LiteralPath $mappedPatched)) {
+        if (-not $procAlive -and $mappedPatched -and (Test-Path -LiteralPath $mappedPatched)) {
             Remove-Item -LiteralPath $mappedPatched -Force -ErrorAction SilentlyContinue
+        }
+
+        if ($procAlive -and $canonicalRestored -and $cleanupStarted) {
+            Write-Warning 'GPU verification failed after the signed DLL was restored. MapleStory was left running; cleanup will occur after it exits.'
         }
 
         throw $err

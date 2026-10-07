@@ -21,16 +21,16 @@ Verified so far:
 - DXGI physical-GPU enumeration
 - GPU name / LUID / DXGI index mapping
 - semantic DXGI call-pair discovery across multiple compiler code-generation forms
-- dynamic in-.text trampoline generation without fixed offsets
-- dynamic patch-plan generation
+- exact adapter targeting by DXGI LUID through `IDXGIFactory4::EnumAdapterByLuid`
+- dynamic patch-plan generation without fixed DLL hashes or patch offsets
 - original DLL backup and stale-patch recovery
 - mapped-patched image hash verification
 - immediate restoration of the original signed DLL
 - cleanup watcher architecture
 - local test case with NVIDIA GeForce RTX 4070 Ti + Intel UHD Graphics 770
-- end-to-end validation on two different `Gr2D_DX11.dll` builds with different compiler code generation, including a system with NVIDIA GeForce RTX 5080 + AMD Radeon(TM) Graphics
+- semantic DLL discovery and launch-path validation on two different `Gr2D_DX11.dll` builds with different compiler code generation, including a system with NVIDIA GeForce RTX 5080 + AMD Radeon(TM) Graphics
 
-The generalized "select any DXGI adapter index" backend has now passed end-to-end testing on two distinct DLL builds and two different GPU combinations. Broader compatibility across additional MapleStory regions/builds and hardware still needs more real-world testing.
+The current exact-LUID backend was introduced after a non-default GPU test exposed that index-based selection could still fall back to the discrete GPU. Static / dry-run regression tests now cover both GPUs on the local NVIDIA GeForce RTX 4070 Ti + Intel UHD Graphics 770 system. Additional end-to-end testing is still required before broader compatibility is claimed.
 
 ## Why this exists
 
@@ -38,9 +38,9 @@ MapleStory may ignore normal Windows per-app GPU selection. This project works a
 
 The current build detects active physical adapters at runtime. It does not hard-code Intel, NVIDIA, AMD, a fixed LUID, a fixed GPU count, a fixed DLL hash, or fixed patch offsets.
 
-The DLL backend now locates MapleStory's DXGI adapter-selection loop semantically at runtime. It pairs the initial and looped `EnumAdapterByGpuPreference` COM calls by their shared IID reference and forward/backward HRESULT control flow, finds executable `0xCC` padding inside the PE `.text` section, and builds a small per-run trampoline there. This avoids depending on one compiler's exact argument-setup bytes. The next enumeration call is converted to `DXGI_ERROR_NOT_FOUND`, so Maple's candidate list contains only the selected adapter.
+The DLL backend locates MapleStory's DXGI adapter-selection loop semantically at runtime. It pairs the initial and looped `EnumAdapterByGpuPreference` COM calls by their shared IID reference and forward/backward HRESULT control flow, detects the first call's argument-setup block, and rewrites that block to call `IDXGIFactory4::EnumAdapterByLuid` with the exact LUID of the GPU selected by the user. The following preference-ordered enumeration call is converted to `DXGI_ERROR_NOT_FOUND`, leaving only the exact requested adapter in Maple's candidate list.
 
-The scanner still fails closed when it cannot uniquely identify the expected control-flow structure or a safe code cave. In that case no patch bytes are written.
+The scanner fails closed when it cannot uniquely identify the expected control-flow and argument-setup structure. In that case no patch bytes are written.
 
 ## MapleStory discovery
 
@@ -82,6 +82,8 @@ Per-launch DLL backups and cleanup logs are stored next to the game under:
 `_gpu_seletor_backup\`
 
 If a previous run left a modified `Gr2D_DX11.dll`, the launcher attempts to restore the newest verified signed backup before continuing.
+
+The cleanup watcher is armed immediately after the original signed DLL is restored. A later GPU-verification failure therefore no longer force-closes MapleStory; the running game is left alone and the mapped patched residual is cleaned after normal game exit.
 
 ## Permissions
 

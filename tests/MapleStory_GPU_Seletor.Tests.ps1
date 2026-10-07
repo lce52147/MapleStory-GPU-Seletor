@@ -53,13 +53,15 @@ foreach ($required in @(
     'Find-EnumAdapterByGpuPreferenceSites',
     'Get-R9RipTargetKey',
     'Get-PostCallBranchDirection',
-    'Find-CodeCave',
-    'semantic-call-pair + dynamic-code-cave',
+    'Get-OutputPointerSetup',
+    'semantic-call-pair + inline-EnumAdapterByLuid',
+    'EnumAdapterByLuid',
+    'AdapterLuid',
     'DXGI_ERROR_NOT_FOUND',
     'No patch bytes were written.',
-    'Redirect selected-adapter call through dynamic trampoline',
-    'Stop adapter enumeration after selected adapter',
-    'Dynamic adapter-selection trampoline',
+    'Rewrite first adapter selection as EnumAdapterByLuid',
+    'Stop preference enumeration after exact-LUID adapter',
+    'GPU verification failed after the signed DLL was restored. MapleStory was left running',
     'Invoke-DllAdapterSelectionBackend',
     'DryRunPatch',
     'Wait-ForGr2DMapping',
@@ -99,8 +101,8 @@ if (-not $data.Adapters -or @($data.Adapters).Count -lt 1) {
     throw "FAIL: Probe found no active GPU adapters"
 }
 foreach ($gpu in @($data.Adapters)) {
-    if (-not $gpu.Name -or -not $gpu.Luid -or $null -eq $gpu.DxgiIndex) {
-        throw "FAIL: adapter lacks Name/Luid/DxgiIndex"
+    if (-not $gpu.Name -or -not $gpu.Luid -or $null -eq $gpu.AdapterLuid -or $null -eq $gpu.DxgiIndex) {
+        throw "FAIL: adapter lacks Name/Luid/AdapterLuid/DxgiIndex"
     }
 }
 
@@ -109,11 +111,33 @@ if ($LASTEXITCODE -ne 0) {
     throw "FAIL: DryRunPatch exit code $LASTEXITCODE"
 }
 $plan = ($planJson | Out-String) | ConvertFrom-Json
-if ($null -eq $plan.SelectedAdapter.DxgiIndex -or -not $plan.Patches -or @($plan.Patches).Count -ne 3) {
-    throw "FAIL: DryRunPatch did not produce the three-patch semantic trampoline plan"
+if ($null -eq $plan.SelectedAdapter.DxgiIndex -or -not $plan.Patches -or @($plan.Patches).Count -ne 2) {
+    throw "FAIL: DryRunPatch did not produce the two-patch exact-LUID plan"
 }
-if (-not $plan.Detector -or $plan.Detector.Strategy -ne 'semantic-call-pair + dynamic-code-cave' -or -not $plan.Detector.FirstCallOffset -or -not $plan.Detector.LoopCallOffset -or -not $plan.Detector.CodeCaveOffset) {
-    throw "FAIL: DryRunPatch did not report semantic detector + code-cave evidence"
+if (-not $plan.Detector -or $plan.Detector.Strategy -ne 'semantic-call-pair + inline-EnumAdapterByLuid' -or -not $plan.Detector.SelectedAdapterLuid -or -not $plan.Detector.SetupStartOffset -or -not $plan.Detector.FirstCallOffset -or -not $plan.Detector.LoopCallOffset) {
+    throw "FAIL: DryRunPatch did not report exact-LUID semantic detector evidence"
+}
+
+if ($plan.Patches[0].Replacement -notmatch 'FF 90 D0 00 00 00') {
+    throw "FAIL: exact-LUID plan does not call IDXGIFactory4::EnumAdapterByLuid (vtable +0xD0)"
+}
+
+if (@($data.Adapters).Count -gt 1) {
+    $plan2Json = & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $Target -Mode DryRunPatch -GpuIndex 2
+    if ($LASTEXITCODE -ne 0) {
+        throw "FAIL: second-adapter DryRunPatch exit code $LASTEXITCODE"
+    }
+    $plan2 = ($plan2Json | Out-String) | ConvertFrom-Json
+    $expectedLuid2 = ('0x{0:X16}' -f [uint64]$data.Adapters[1].AdapterLuid)
+    if ($plan2.Detector.SelectedAdapterLuid -ne $expectedLuid2) {
+        throw "FAIL: second-adapter exact LUID mismatch: expected=$expectedLuid2 actual=$($plan2.Detector.SelectedAdapterLuid)"
+    }
 }
 
 Write-Host ("PASS: path={0}; adapters={1}; selectedDxgiIndex={2}; backend=DLL" -f $data.GamePath,@($data.Adapters).Count,$plan.SelectedAdapter.DxgiIndex)
+
+$watcherIndex = $text.IndexOf('$cleanupStarted = $true',[StringComparison]::Ordinal)
+$verifyIndex = $text.IndexOf('$gpu = Verify-ProcessGpu -Process $proc -Adapter $Adapter',[StringComparison]::Ordinal)
+if ($watcherIndex -lt 0 -or $verifyIndex -lt 0 -or $watcherIndex -gt $verifyIndex) {
+    throw 'FAIL: cleanup watcher must be armed before GPU verification.'
+}
