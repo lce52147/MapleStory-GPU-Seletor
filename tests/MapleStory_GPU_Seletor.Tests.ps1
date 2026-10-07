@@ -53,6 +53,9 @@ foreach ($required in @(
     'Wait-ForGr2DMapping',
     'Start-Process -FilePath $MapleStoryPath',
     '[string]$Mode = ''Launch''',
+    'Assert-GameWriteAccess',
+    'MapleStory folder is not writable by the current user.',
+    'Run the selector with the same privilege level as the login/launcher tool',
     'Restore-LatestOriginal',
     'Mapped patched image hash mismatch',
     "'_gpu_seletor_backup'",
@@ -62,6 +65,13 @@ foreach ($required in @(
     if ($text -notmatch [regex]::Escape($required)) {
         throw "FAIL: missing architecture marker: $required"
     }
+}
+
+$preflightCall = 'Assert-GameWriteAccess -GameDir $gameDir -DllPath $dll -BackupDir $backupDir'
+$preflightIndex = $text.IndexOf($preflightCall,[StringComparison]::Ordinal)
+$patchPlanIndex = $text.IndexOf('$plan = Build-DllPatchPlan -DllPath $dll -Adapter $Adapter',[StringComparison]::Ordinal)
+if ($preflightIndex -lt 0 -or $patchPlanIndex -lt 0 -or $preflightIndex -gt $patchPlanIndex) {
+    throw 'FAIL: write-access preflight must run before patch-plan construction.'
 }
 
 $json = & pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $Target -Mode Probe

@@ -76,6 +76,14 @@ Per-launch DLL backups and cleanup logs are stored next to the game under:
 
 If a previous run left a modified `Gr2D_DX11.dll`, the launcher attempts to restore the newest verified signed backup before continuing.
 
+## Permissions
+
+Before patching anything, the launcher runs a write-access preflight against both the MapleStory folder and `_gpu_seletor_backup`. It verifies that the current Windows user can create, rename, and delete temporary files and can open the existing `Gr2D_DX11.dll` for write access without changing its bytes.
+
+If the installation is under a protected location such as `Program Files`, the current user may not have enough NTFS permissions. In that case the launcher stops before patching and reports the permission problem.
+
+The selector does not automatically elevate itself. If elevation is required, run the selector and the external login/launcher tool at the same privilege level. A normal-user selector paired with a normal-user login tool is preferred when the game directory is already writable.
+
 ## Compatibility
 
 Designed for Windows 10/11 systems with DXGI 1.6 / `IDXGIFactory6::EnumAdapterByGpuPreference`.

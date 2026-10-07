@@ -866,6 +866,71 @@ function Wait-ForGr2DMapping([System.Diagnostics.Process]$Process) {
     }
 }
 
+function Assert-GameWriteAccess([string]$GameDir,[string]$DllPath,[string]$BackupDir) {
+    $probePaths = [System.Collections.Generic.List[string]]::new()
+    $dllStream = $null
+
+    try {
+        if (-not (Test-Path -LiteralPath $BackupDir -PathType Container)) {
+            New-Item -ItemType Directory -Path $BackupDir -Force -ErrorAction Stop | Out-Null
+        }
+
+        foreach ($dir in @($GameDir,$BackupDir)) {
+            $token = [guid]::NewGuid().ToString('N')
+            $source = Join-Path $dir ('.MapleStoryGPUSeletor_write_test_{0}.tmp' -f $token)
+            $renamed = Join-Path $dir ('.MapleStoryGPUSeletor_write_test_{0}.renamed.tmp' -f $token)
+            $probePaths.Add($source)
+            $probePaths.Add($renamed)
+
+            [IO.File]::WriteAllText($source,'write-test',[Text.Encoding]::ASCII)
+            Move-Item -LiteralPath $source -Destination $renamed -ErrorAction Stop
+            Remove-Item -LiteralPath $renamed -Force -ErrorAction Stop
+        }
+
+        $dllInfo = Get-Item -LiteralPath $DllPath -ErrorAction Stop
+        if (($dllInfo.Attributes -band [IO.FileAttributes]::ReadOnly) -ne 0) {
+            throw 'Gr2D_DX11.dll is marked read-only.'
+        }
+
+        # Opening the existing DLL for ReadWrite verifies that the current token
+        # can modify it without changing any bytes.
+        $dllStream = [IO.File]::Open(
+            $DllPath,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::ReadWrite,
+            [IO.FileShare]::Read
+        )
+        $dllStream.Dispose()
+        $dllStream = $null
+    }
+    catch {
+        $reason = $_.Exception.Message
+        throw @"
+MapleStory folder is not writable by the current user.
+
+Path:
+$GameDir
+
+The selector must temporarily modify, rename, and restore Gr2D_DX11.dll before MapleStory starts using it.
+
+Reason:
+$reason
+
+Run the selector with the same privilege level as the login/launcher tool, or install MapleStory in a user-writable game folder such as D:\Games\MapleStory.
+"@
+    }
+    finally {
+        if ($dllStream) {
+            $dllStream.Dispose()
+        }
+        foreach ($p in $probePaths) {
+            if (Test-Path -LiteralPath $p) {
+                Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
 function Restore-LatestOriginal([string]$BackupDir,[string]$DllPath) {
     $cand = Get-ChildItem -LiteralPath $BackupDir -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -like 'Gr2D_DX11.dll.*.launch-original' } |
@@ -900,7 +965,7 @@ function Invoke-DllAdapterSelectionBackend([string]$MapleStoryPath,[object]$Adap
 
     Ensure-StateDirectories
     $backupDir = Join-Path $gameDir '_gpu_seletor_backup'
-    New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
+    Assert-GameWriteAccess -GameDir $gameDir -DllPath $dll -BackupDir $backupDir
 
     $currentSignature = Get-AuthenticodeSignature -LiteralPath $dll
     if ($currentSignature.Status -ne 'Valid') {
