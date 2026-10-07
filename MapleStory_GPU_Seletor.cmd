@@ -11,17 +11,17 @@ if not exist "%SCRIPT%" (
     exit /b 2
 )
 
-where pwsh.exe >nul 2>&1
+where powershell.exe >nul 2>&1
 if "%errorlevel%"=="0" (
-    pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%"
+    powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%"
 ) else (
-    where powershell.exe >nul 2>&1
+    where pwsh.exe >nul 2>&1
     if not "%errorlevel%"=="0" (
         echo [ERROR] PowerShell was not found.
         pause
         exit /b 3
     )
-    powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%"
+    pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%"
 )
 
 set "RC=%errorlevel%"

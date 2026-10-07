@@ -74,7 +74,7 @@ if ($preflightIndex -lt 0 -or $patchPlanIndex -lt 0 -or $preflightIndex -gt $pat
     throw 'FAIL: write-access preflight must run before patch-plan construction.'
 }
 
-$json = & pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $Target -Mode Probe
+$json = & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $Target -Mode Probe
 if ($LASTEXITCODE -ne 0) {
     throw "FAIL: Probe mode exit code $LASTEXITCODE"
 }
@@ -92,7 +92,7 @@ foreach ($gpu in @($data.Adapters)) {
     }
 }
 
-$planJson = & pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $Target -Mode DryRunPatch -GpuIndex 1
+$planJson = & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $Target -Mode DryRunPatch -GpuIndex 1
 if ($LASTEXITCODE -ne 0) {
     throw "FAIL: DryRunPatch exit code $LASTEXITCODE"
 }

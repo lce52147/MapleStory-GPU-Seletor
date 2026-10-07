@@ -1022,9 +1022,9 @@ function Invoke-DllAdapterSelectionBackend([string]$MapleStoryPath,[object]$Adap
 
         $startTicks = $proc.StartTime.Ticks
         $log = Join-Path $backupDir 'MapleStory_GPU_Seletor_cleanup.log'
-        $pwsh = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
-        if (-not $pwsh) {
-            $pwsh = (Get-Command powershell.exe).Source
+        $shell = (Get-Command powershell.exe -ErrorAction SilentlyContinue).Source
+        if (-not $shell) {
+            $shell = (Get-Command pwsh.exe -ErrorAction Stop).Source
         }
 
         $args = @(
@@ -1040,7 +1040,7 @@ function Invoke-DllAdapterSelectionBackend([string]$MapleStoryPath,[object]$Adap
             '-LogPath',$log
         )
 
-        $watch = Start-Process -FilePath $pwsh -ArgumentList $args -WindowStyle Hidden -PassThru
+        $watch = Start-Process -FilePath $shell -ArgumentList $args -WindowStyle Hidden -PassThru
         Start-Sleep -Milliseconds 200
         if ($watch.HasExited) {
             throw 'Cleanup watcher failed to stay running.'

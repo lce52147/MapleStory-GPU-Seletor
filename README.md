@@ -9,7 +9,7 @@ Normal use is intentionally simple:
 3. The launcher finds the local MapleStory installation, enumerates available physical GPUs, and asks which GPU to use.
 4. It temporarily patches `Gr2D_DX11.dll`, starts `MapleStory.exe`, waits for graphics initialization, immediately restores the original signed DLL on disk, and verifies the selected GPU by LUID.
 
-No EXE installer is required. The CMD launcher prefers PowerShell 7 when available and falls back to Windows PowerShell with `-ExecutionPolicy Bypass`.
+No EXE installer is required. The CMD launcher uses Windows PowerShell 5.1 (`powershell.exe`) by default, which is built into Windows 11, and falls back to PowerShell 7 (`pwsh.exe`) only when needed. It launches with `-ExecutionPolicy Bypass` for the script process.
 
 ## Status
 
@@ -63,6 +63,12 @@ If multiple installations are found, the selection list adds a region/source hin
 - `MapleStory_GPU_Seletor.cmd` — user entry point
 - `MapleStory_GPU_Seletor.ps1` — main implementation
 - `tests/MapleStory_GPU_Seletor.Tests.ps1` — architecture / probe / dry-run regression checks
+
+## Permissions
+
+Before touching `Gr2D_DX11.dll`, the launcher runs a write-access preflight. It verifies that the current user can create, rename, and delete temporary files in the game/backup folders and can open the DLL for read/write access without changing its contents.
+
+If the MapleStory folder is protected (for example under some `Program Files` installs), the launcher fails before patching and explains the permission problem. The selector should normally run at the same privilege level as the user's login/launcher tool; installing the game in a user-writable folder avoids UAC/integrity-level mismatches.
 
 ## Runtime behavior
 
