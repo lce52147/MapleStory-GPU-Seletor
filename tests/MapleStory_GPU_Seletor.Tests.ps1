@@ -22,7 +22,9 @@ foreach ($forbidden in @(
     'UserGpuPreferences',
     'SpecificAdapter',
     'WaitForExternalLaunch',
-    'Timed out waiting for Gr2D_DX11.dll to map.'
+    'Timed out waiting for Gr2D_DX11.dll to map.',
+    'Find-UniquePatternOffset',
+    'final adapter fallback'
 )) {
     if ($text -match [regex]::Escape($forbidden)) {
         throw "FAIL: forbidden machine/OS-specific backend remains: $forbidden"
@@ -48,6 +50,16 @@ foreach ($required in @(
     'DxgiIndex',
     'Select-GpuAdapter',
     'Build-DllPatchPlan',
+    'Find-EnumAdapterByGpuPreferenceSites',
+    'Get-R9RipTargetKey',
+    'Get-PostCallBranchDirection',
+    'Find-CodeCave',
+    'semantic-call-pair + dynamic-code-cave',
+    'DXGI_ERROR_NOT_FOUND',
+    'No patch bytes were written.',
+    'Redirect selected-adapter call through dynamic trampoline',
+    'Stop adapter enumeration after selected adapter',
+    'Dynamic adapter-selection trampoline',
     'Invoke-DllAdapterSelectionBackend',
     'DryRunPatch',
     'Wait-ForGr2DMapping',
@@ -97,8 +109,11 @@ if ($LASTEXITCODE -ne 0) {
     throw "FAIL: DryRunPatch exit code $LASTEXITCODE"
 }
 $plan = ($planJson | Out-String) | ConvertFrom-Json
-if ($null -eq $plan.SelectedAdapter.DxgiIndex -or -not $plan.Patches -or @($plan.Patches).Count -lt 3) {
-    throw "FAIL: DryRunPatch did not produce selected adapter + patch plan"
+if ($null -eq $plan.SelectedAdapter.DxgiIndex -or -not $plan.Patches -or @($plan.Patches).Count -ne 3) {
+    throw "FAIL: DryRunPatch did not produce the three-patch semantic trampoline plan"
+}
+if (-not $plan.Detector -or $plan.Detector.Strategy -ne 'semantic-call-pair + dynamic-code-cave' -or -not $plan.Detector.FirstCallOffset -or -not $plan.Detector.LoopCallOffset -or -not $plan.Detector.CodeCaveOffset) {
+    throw "FAIL: DryRunPatch did not report semantic detector + code-cave evidence"
 }
 
 Write-Host ("PASS: path={0}; adapters={1}; selectedDxgiIndex={2}; backend=DLL" -f $data.GamePath,@($data.Adapters).Count,$plan.SelectedAdapter.DxgiIndex)

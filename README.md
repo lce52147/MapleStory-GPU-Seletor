@@ -20,6 +20,8 @@ Verified so far:
 - automatic MapleStory path discovery and caching
 - DXGI physical-GPU enumeration
 - GPU name / LUID / DXGI index mapping
+- semantic DXGI call-pair discovery across multiple compiler code-generation forms
+- dynamic in-.text trampoline generation without fixed offsets
 - dynamic patch-plan generation
 - original DLL backup and stale-patch recovery
 - mapped-patched image hash verification
@@ -33,7 +35,11 @@ The generalized "select any DXGI adapter index" backend still needs additional e
 
 MapleStory may ignore normal Windows per-app GPU selection. This project works at the game's DX11 adapter-selection path instead of relying on Windows Graphics Settings.
 
-The current build detects active physical adapters at runtime. It does not hard-code Intel, NVIDIA, AMD, a fixed LUID, or a fixed number of GPUs.
+The current build detects active physical adapters at runtime. It does not hard-code Intel, NVIDIA, AMD, a fixed LUID, a fixed GPU count, a fixed DLL hash, or fixed patch offsets.
+
+The DLL backend now locates MapleStory's DXGI adapter-selection loop semantically at runtime. It pairs the initial and looped `EnumAdapterByGpuPreference` COM calls by their shared IID reference and forward/backward HRESULT control flow, finds executable `0xCC` padding inside the PE `.text` section, and builds a small per-run trampoline there. This avoids depending on one compiler's exact argument-setup bytes. The next enumeration call is converted to `DXGI_ERROR_NOT_FOUND`, so Maple's candidate list contains only the selected adapter.
+
+The scanner still fails closed when it cannot uniquely identify the expected control-flow structure or a safe code cave. In that case no patch bytes are written.
 
 ## MapleStory discovery
 

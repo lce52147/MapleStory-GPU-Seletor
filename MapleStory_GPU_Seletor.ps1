@@ -631,13 +631,213 @@ function Select-GpuAdapter([object[]]$Adapters) {
     }
 }
 
-function Find-UniquePatternOffset([byte[]]$Data,[byte[]]$Pattern,[string]$Name) {
-    Initialize-DxgiProbe
-    $hits = @([MapleStoryGpuSeletor.DxgiProbe]::FindAll($Data,$Pattern))
-    if ($hits.Count -ne 1) {
-        throw "Patch signature '$Name' expected exactly once, found $($hits.Count)."
+function Get-R9RipTargetKey([byte[]]$Data,[int]$CallOffset) {
+    # EnumAdapterByGpuPreference receives REFIID in R9. MSVC normally materializes
+    # that constant as: 4C 8D 0D <disp32>  (lea r9,[rip+disp32]).
+    # The absolute VA is unnecessary here; fileOffset + instructionLength + disp32
+    # is sufficient as a stable key for pairing calls that reference the same IID.
+    $start = [Math]::Max(0,$CallOffset - 64)
+    $last = $null
+    for ($i = $start; $i -le ($CallOffset - 7); $i++) {
+        if (
+            $Data[$i] -eq 0x4C -and
+            $Data[$i + 1] -eq 0x8D -and
+            $Data[$i + 2] -eq 0x0D
+        ) {
+            $disp = [BitConverter]::ToInt32($Data,$i + 3)
+            $last = [pscustomobject]@{
+                LeaOffset = $i
+                TargetKey = ([int64]$i + 7 + [int64]$disp)
+            }
+        }
     }
-    [int]$hits[0]
+    $last
+}
+
+function Get-PostCallBranchDirection([byte[]]$Data,[int]$CallOffset) {
+    # Both the initial selection call and the enumeration-loop call test HRESULT
+    # immediately afterwards. The initial failure branch goes forward; the loop
+    # success branch goes backward to append another adapter.
+    $p = $CallOffset + 6
+    if (($p + 4) -ge $Data.Length) {
+        return $null
+    }
+    if ($Data[$p] -ne 0x85 -or $Data[$p + 1] -ne 0xC0) {
+        return $null
+    }
+
+    $j = $p + 2
+
+    # near Jcc: 0F 8x rel32
+    if (
+        ($j + 5) -lt $Data.Length -and
+        $Data[$j] -eq 0x0F -and
+        $Data[$j + 1] -ge 0x80 -and
+        $Data[$j + 1] -le 0x8F
+    ) {
+        $disp = [BitConverter]::ToInt32($Data,$j + 2)
+        if ($disp -lt 0) { return 'Backward' }
+        return 'Forward'
+    }
+
+    # short Jcc: 7x rel8
+    if (
+        ($j + 1) -lt $Data.Length -and
+        $Data[$j] -ge 0x70 -and
+        $Data[$j] -le 0x7F
+    ) {
+        $disp = [sbyte]$Data[$j + 1]
+        if ($disp -lt 0) { return 'Backward' }
+        return 'Forward'
+    }
+
+    $null
+}
+
+function Get-PeTextSection([byte[]]$Data) {
+    if ($Data.Length -lt 0x100) {
+        throw 'PE image is too small.'
+    }
+
+    $peOffset = [BitConverter]::ToInt32($Data,0x3C)
+    if (
+        $peOffset -lt 0 -or
+        ($peOffset + 24) -ge $Data.Length -or
+        $Data[$peOffset] -ne 0x50 -or
+        $Data[$peOffset + 1] -ne 0x45 -or
+        $Data[$peOffset + 2] -ne 0x00 -or
+        $Data[$peOffset + 3] -ne 0x00
+    ) {
+        throw 'Invalid PE header.'
+    }
+
+    $sectionCount = [BitConverter]::ToUInt16($Data,$peOffset + 6)
+    $optionalHeaderSize = [BitConverter]::ToUInt16($Data,$peOffset + 20)
+    $sectionTable = $peOffset + 24 + $optionalHeaderSize
+
+    for ($i = 0; $i -lt $sectionCount; $i++) {
+        $s = $sectionTable + ($i * 40)
+        if (($s + 40) -gt $Data.Length) {
+            break
+        }
+
+        $name = [Text.Encoding]::ASCII.GetString($Data,$s,8).Trim([char]0)
+        if ($name -ne '.text') {
+            continue
+        }
+
+        $virtualSize = [BitConverter]::ToUInt32($Data,$s + 8)
+        $rawSize = [BitConverter]::ToUInt32($Data,$s + 16)
+        $rawPointer = [BitConverter]::ToUInt32($Data,$s + 20)
+
+        $usable = [int64]$rawSize
+        if ($virtualSize -gt 0 -and [int64]$virtualSize -lt $usable) {
+            $usable = [int64]$virtualSize
+        }
+
+        if (
+            $rawPointer -ge $Data.Length -or
+            ([int64]$rawPointer + $usable) -gt $Data.Length -or
+            $usable -lt 1
+        ) {
+            throw 'Invalid .text section bounds.'
+        }
+
+        return [pscustomobject]@{
+            RawOffset = [int]$rawPointer
+            Length = [int]$usable
+        }
+    }
+
+    throw '.text section not found.'
+}
+
+function Find-CodeCave([byte[]]$Data,[int]$Length) {
+    $text = Get-PeTextSection -Data $Data
+    $start = [int]$text.RawOffset
+    $end = $start + [int]$text.Length
+
+    $runStart = -1
+    $runLength = 0
+    $last = -1
+
+    for ($i = $start; $i -lt $end; $i++) {
+        if ($Data[$i] -eq 0xCC) {
+            if ($runLength -eq 0) {
+                $runStart = $i
+            }
+            $runLength++
+            if ($runLength -ge $Length) {
+                $last = $runStart
+            }
+        }
+        else {
+            $runStart = -1
+            $runLength = 0
+        }
+    }
+
+    if ($last -lt 0) {
+        throw "No executable 0xCC code cave of at least $Length bytes was found in .text."
+    }
+
+    [int]$last
+}
+
+function Find-EnumAdapterByGpuPreferenceSites([byte[]]$Data,[string]$DllHash) {
+    Initialize-DxgiProbe
+
+    $callPattern = [byte[]](0xFF,0x90,0xE8,0x00,0x00,0x00)
+    $callOffsets = @([MapleStoryGpuSeletor.DxgiProbe]::FindAll($Data,$callPattern))
+    $calls = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($rawOffset in $callOffsets) {
+        $callOffset = [int]$rawOffset
+        $iid = Get-R9RipTargetKey -Data $Data -CallOffset $callOffset
+        if (-not $iid) {
+            continue
+        }
+
+        $direction = Get-PostCallBranchDirection -Data $Data -CallOffset $callOffset
+        if (-not $direction) {
+            continue
+        }
+
+        $calls.Add([pscustomobject]@{
+            CallOffset = $callOffset
+            IidTargetKey = [int64]$iid.TargetKey
+            IidLeaOffset = [int]$iid.LeaOffset
+            BranchDirection = $direction
+        })
+    }
+
+    $pairs = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($first in @($calls | Where-Object { $_.BranchDirection -eq 'Forward' })) {
+        foreach ($loop in @(
+            $calls |
+                Where-Object {
+                    $_.BranchDirection -eq 'Backward' -and
+                    $_.CallOffset -gt $first.CallOffset -and
+                    $_.CallOffset -le ($first.CallOffset + 0x1000) -and
+                    $_.IidTargetKey -eq $first.IidTargetKey
+                } |
+                Sort-Object CallOffset
+        )) {
+            $pairs.Add([pscustomobject]@{
+                FirstCallOffset = [int]$first.CallOffset
+                LoopCallOffset = [int]$loop.CallOffset
+                IidTargetKey = [int64]$first.IidTargetKey
+            })
+            break
+        }
+    }
+
+    if ($pairs.Count -ne 1) {
+        throw "Could not uniquely locate the EnumAdapterByGpuPreference selection loop in this Gr2D_DX11.dll (matches=$($pairs.Count), SHA256=$DllHash). No patch bytes were written."
+    }
+
+    $pairs[0]
 }
 
 function Bytes-ToHex([byte[]]$Bytes) {
@@ -655,62 +855,78 @@ function Build-DllPatchPlan([string]$DllPath,[object]$Adapter) {
     }
 
     $data = [IO.File]::ReadAllBytes($DllPath)
-
-    $firstSignature = [byte[]](
-        0x33,0xD2,0x41,0xB8,0x02,0x00,0x00,0x00,
-        0xFF,0x90,0xE8,0x00,0x00,0x00
-    )
-    $loopSignature = [byte[]](
-        0x41,0xB8,0x02,0x00,0x00,0x00,
-        0x8B,0xD3,0xFF,0x90,0xE8,0x00,0x00,0x00
-    )
-    $finalSignature = [byte[]](
-        0x48,0x8B,0xCF,0x48,0x85,0xDB,
-        0x48,0x0F,0x45,0xCB,
-        0x48,0x8B,0x74,0x24,0x70
-    )
-
-    $firstOffset = Find-UniquePatternOffset $data $firstSignature 'first EnumAdapterByGpuPreference'
-    $loopOffset = Find-UniquePatternOffset $data $loopSignature 'adapter enumeration loop'
-    $finalOffset = Find-UniquePatternOffset $data $finalSignature 'final adapter fallback'
-
+    $originalHash = Hash $DllPath
+    $sites = Find-EnumAdapterByGpuPreferenceSites -Data $data -DllHash $originalHash
     $selectedIndex = [byte]$Adapter.DxgiIndex
 
-    # Existing Maple code calls:
-    # EnumAdapterByGpuPreference(AdapterIndex, DXGI_GPU_PREFERENCE, ...)
-    # This 8-byte replacement loads the selected DXGI index into RDX and
-    # DXGI_GPU_PREFERENCE_UNSPECIFIED (0) into R8 without changing code size.
-    $firstReplacement = [byte[]](
-        0x33,0xD2,           # xor edx, edx
-        0x83,0xC2,$selectedIndex, # add edx, AdapterIndex
-        0x45,0x33,0xC0      # xor r8d, r8d (UNSPECIFIED)
+    # Do not depend on the compiler's exact argument-setup instructions.
+    # Redirect only the first six-byte COM call to a tiny in-.text trampoline.
+    # CALL pushes the original return address; the trampoline rewrites RDX/R8D
+    # and tail-jumps to the original vtable method. The DXGI method returns
+    # directly to the byte after our CALL, preserving the original call shape.
+    $stub = [byte[]](
+        0x6A,$selectedIndex,       # push AdapterIndex (0..127)
+        0x5A,                      # pop rdx
+        0x45,0x33,0xC0,           # xor r8d,r8d (UNSPECIFIED)
+        0xFF,0xA0,0xE8,0x00,0x00,0x00 # jmp qword ptr [rax+E8]
     )
+
+    $caveOffset = Find-CodeCave -Data $data -Length $stub.Length
+    if (
+        ($caveOffset -ge $sites.FirstCallOffset -and $caveOffset -lt ($sites.FirstCallOffset + 6)) -or
+        ($caveOffset -ge $sites.LoopCallOffset -and $caveOffset -lt ($sites.LoopCallOffset + 6))
+    ) {
+        throw 'Selected code cave overlaps an adapter-selection call site.'
+    }
+
+    $rel64 = [int64]$caveOffset - ([int64]$sites.FirstCallOffset + 5)
+    if ($rel64 -lt [int32]::MinValue -or $rel64 -gt [int32]::MaxValue) {
+        throw 'Selected code cave is outside rel32 CALL range.'
+    }
+
+    $rel = [BitConverter]::GetBytes([int32]$rel64)
+    $firstReplacement = [byte[]](
+        0xE8,$rel[0],$rel[1],$rel[2],$rel[3], # call rel32 trampoline
+        0x90                                  # preserve original 6-byte width
+    )
+
+    # Once Maple has appended the selected adapter, stop the next enumeration
+    # iteration by returning the actual DXGI_ERROR_NOT_FOUND HRESULT in EAX.
+    # Existing post-call control flow exits the loop naturally, leaving only the
+    # selected adapter in the candidate vector.
+    $loopReplacement = [byte[]](0xB8,0x02,0x00,0x7A,0x88,0x90)
 
     $patches = @(
         [pscustomobject]@{
-            Name = 'Selected adapter index + unspecified preference'
-            Offset = $firstOffset
-            OriginalBytes = [byte[]]$data[$firstOffset..($firstOffset + 7)]
+            Name = 'Redirect selected-adapter call through dynamic trampoline'
+            Offset = [int]$sites.FirstCallOffset
+            OriginalBytes = [byte[]]$data[$sites.FirstCallOffset..($sites.FirstCallOffset + 5)]
             NewBytes = $firstReplacement
         },
         [pscustomobject]@{
-            Name = 'Enumeration loop preference = unspecified'
-            Offset = $loopOffset
-            OriginalBytes = [byte[]]$data[$loopOffset..($loopOffset + 5)]
-            NewBytes = [byte[]](0x41,0xB8,0x00,0x00,0x00,0x00)
+            Name = 'Stop adapter enumeration after selected adapter'
+            Offset = [int]$sites.LoopCallOffset
+            OriginalBytes = [byte[]]$data[$sites.LoopCallOffset..($sites.LoopCallOffset + 5)]
+            NewBytes = $loopReplacement
         },
         [pscustomobject]@{
-            Name = 'Keep primary selected adapter; disable final fallback overwrite'
-            Offset = $finalOffset + 6
-            OriginalBytes = [byte[]]$data[($finalOffset + 6)..($finalOffset + 9)]
-            NewBytes = [byte[]](0x90,0x90,0x90,0x90)
+            Name = 'Dynamic adapter-selection trampoline'
+            Offset = [int]$caveOffset
+            OriginalBytes = [byte[]]$data[$caveOffset..($caveOffset + $stub.Length - 1)]
+            NewBytes = $stub
         }
     )
 
     [pscustomobject]@{
         DllPath = $DllPath
-        OriginalHash = Hash $DllPath
+        OriginalHash = $originalHash
         SelectedAdapter = $Adapter
+        Detector = [pscustomobject]@{
+            Strategy = 'semantic-call-pair + dynamic-code-cave'
+            FirstCallOffset = ('0x{0:X}' -f $sites.FirstCallOffset)
+            LoopCallOffset = ('0x{0:X}' -f $sites.LoopCallOffset)
+            CodeCaveOffset = ('0x{0:X}' -f $caveOffset)
+        }
         Patches = $patches
     }
 }
@@ -1107,6 +1323,7 @@ if ($Mode -eq 'DryRunPatch') {
         GamePath = $gamePath
         SelectedAdapter = $selected
         OriginalHash = $plan.OriginalHash
+        Detector = $plan.Detector
         Patches = @(
             $plan.Patches | ForEach-Object {
                 [pscustomobject]@{
