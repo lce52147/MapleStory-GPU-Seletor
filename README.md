@@ -35,6 +35,29 @@ MapleStory may ignore normal Windows per-app GPU selection. This project works a
 
 The current build detects active physical adapters at runtime. It does not hard-code Intel, NVIDIA, AMD, a fixed LUID, or a fixed number of GPUs.
 
+## MapleStory discovery
+
+The launcher does not assume MapleStory is installed on C:, D:, or E:. It searches in this order:
+
+1. cached path from the previous successful discovery
+2. the folder containing the launcher
+3. Desktop, Public Desktop, Documents, and Downloads
+4. Desktop / Start Menu shortcuts
+5. Windows uninstall registry entries
+6. Steam libraries from `steamapps\libraryfolders.vdf`
+7. common regional install layouts across every local fixed drive
+8. full fixed-drive search only as a final fallback
+
+Known layouts currently include:
+
+- TMS: Gamania / gamania Games
+- KMS: `Nexon\Maple`
+- GMS: Nexon Library / Nexon Launcher layouts
+- GMS Steam: `steamapps\common\MapleStory`
+- MSEA: `Wizet\MapleStorySEA`
+
+If multiple installations are found, the selection list adds a region/source hint such as `TMS`, `KMS`, `GMS/Nexon`, `Steam`, or `MSEA`.
+
 ## Files
 
 - `MapleStory_GPU_Seletor.cmd` — user entry point

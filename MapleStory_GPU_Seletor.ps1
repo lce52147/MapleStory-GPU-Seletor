@@ -116,11 +116,130 @@ function Get-RegistryMapleCandidates {
     @($out | Select-Object -Unique)
 }
 
+function Get-UserSearchRoots {
+    $roots = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($folder in @(
+        [Environment]::GetFolderPath('Desktop'),
+        [Environment]::GetFolderPath('CommonDesktopDirectory'),
+        [Environment]::GetFolderPath('MyDocuments')
+    )) {
+        if ($folder -and (Test-Path -LiteralPath $folder -PathType Container)) {
+            $roots.Add($folder)
+        }
+    }
+
+    try {
+        $shellFolders = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -ErrorAction Stop
+        $downloads = [Environment]::ExpandEnvironmentVariables(
+            [string]$shellFolders.'{374DE290-123F-4565-9164-39C4925E467B}'
+        )
+        if ($downloads -and (Test-Path -LiteralPath $downloads -PathType Container)) {
+            $roots.Add($downloads)
+        }
+    }
+    catch {
+        $downloads = Join-Path $env:USERPROFILE 'Downloads'
+        if (Test-Path -LiteralPath $downloads -PathType Container) {
+            $roots.Add($downloads)
+        }
+    }
+
+    @($roots | Select-Object -Unique)
+}
+
+function Get-UserFolderMapleCandidates {
+    $found = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($root in @(Get-UserSearchRoots)) {
+        try {
+            Get-ChildItem -LiteralPath $root -Filter 'MapleStory.exe' -File -Recurse -ErrorAction SilentlyContinue |
+                ForEach-Object { $found.Add($_.FullName) }
+        }
+        catch {}
+    }
+
+    @($found | Select-Object -Unique)
+}
+
+function Get-SteamLibraryRoots {
+    $roots = [System.Collections.Generic.List[string]]::new()
+    $steamPaths = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($key in @(
+        'HKCU:\Software\Valve\Steam',
+        'HKLM:\SOFTWARE\WOW6432Node\Valve\Steam',
+        'HKLM:\SOFTWARE\Valve\Steam'
+    )) {
+        try {
+            $p = Get-ItemProperty -LiteralPath $key -ErrorAction Stop
+            foreach ($value in @($p.SteamPath,$p.InstallPath)) {
+                if ($value -and (Test-Path -LiteralPath $value -PathType Container)) {
+                    $steamPaths.Add([string]$value)
+                }
+            }
+        }
+        catch {}
+    }
+
+    foreach ($steamRoot in @($steamPaths | Select-Object -Unique)) {
+        $roots.Add($steamRoot)
+        $vdf = Join-Path $steamRoot 'steamapps\libraryfolders.vdf'
+        if (-not (Test-Path -LiteralPath $vdf -PathType Leaf)) {
+            continue
+        }
+
+        try {
+            $raw = Get-Content -LiteralPath $vdf -Raw -ErrorAction Stop
+            foreach ($m in [regex]::Matches($raw,'"path"\s+"([^"]+)"')) {
+                $path = $m.Groups[1].Value -replace '\\\\','\'
+                if ($path -and (Test-Path -LiteralPath $path -PathType Container)) {
+                    $roots.Add($path)
+                }
+            }
+        }
+        catch {}
+    }
+
+    @($roots | Select-Object -Unique)
+}
+
+function Get-SteamMapleCandidates {
+    $out = [System.Collections.Generic.List[string]]::new()
+    foreach ($root in @(Get-SteamLibraryRoots)) {
+        $out.Add((Join-Path $root 'steamapps\common\MapleStory\MapleStory.exe'))
+    }
+    @($out | Select-Object -Unique)
+}
+
+function Get-MapleInstallLabel([string]$Path) {
+    if ($Path -match '(?i)\\gamania(?: Games)?\\MapleStory\\') {
+        return 'TMS'
+    }
+    if ($Path -match '(?i)\\Nexon\\Maple\\') {
+        return 'KMS'
+    }
+    if ($Path -match '(?i)\\Nexon\\Library\\maplestory\\') {
+        return 'GMS/Nexon'
+    }
+    if ($Path -match '(?i)\\steamapps\\common\\MapleStory\\') {
+        return 'Steam'
+    }
+    if ($Path -match '(?i)\\Wizet\\MapleStorySEA\\') {
+        return 'MSEA'
+    }
+    return 'MapleStory'
+}
+
 function Get-FastMapleCandidates {
     $out = [System.Collections.Generic.List[string]]::new()
 
     if ($PSScriptRoot) {
         $out.Add((Join-Path $PSScriptRoot 'MapleStory.exe'))
+    }
+
+    foreach ($p in @(Get-UserFolderMapleCandidates)) {
+        $out.Add($p)
     }
 
     foreach ($p in @(Get-ShortcutTargets)) {
@@ -131,17 +250,43 @@ function Get-FastMapleCandidates {
         $out.Add($p)
     }
 
+    foreach ($p in @(Get-SteamMapleCandidates)) {
+        $out.Add($p)
+    }
+
     $drives = Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue |
         Select-Object -ExpandProperty DeviceID
 
+    $knownRelativePaths = @(
+        # Taiwan MapleStory (TMS)
+        'Program Files\gamania Games\MapleStory\MapleStory.exe',
+        'Program Files (x86)\gamania Games\MapleStory\MapleStory.exe',
+        'Program Files\Gamania\MapleStory\MapleStory.exe',
+        'Program Files (x86)\Gamania\MapleStory\MapleStory.exe',
+        'Gamania\MapleStory\MapleStory.exe',
+
+        # Korea MapleStory (KMS)
+        'Nexon\Maple\MapleStory.exe',
+
+        # Global MapleStory (GMS / Nexon Launcher)
+        'Nexon\Library\maplestory\MapleStory.exe',
+        'Nexon\Library\maplestory\appdata\MapleStory.exe',
+        'Program Files (x86)\Nexon\maplestory\appdata\MapleStory.exe',
+
+        # MapleStorySEA (MSEA)
+        'Program Files (x86)\Wizet\MapleStorySEA\MapleStory.exe',
+        'Program Files\Wizet\MapleStorySEA\MapleStory.exe',
+        'Wizet\MapleStorySEA\MapleStory.exe',
+
+        # Generic/manual layouts
+        'Games\MapleStory\MapleStory.exe',
+        'MapleStory\MapleStory.exe',
+        'Program Files\MapleStory\MapleStory.exe',
+        'Program Files (x86)\MapleStory\MapleStory.exe'
+    )
+
     foreach ($drive in $drives) {
-        foreach ($relative in @(
-            'Gamania\MapleStory\MapleStory.exe',
-            'Games\MapleStory\MapleStory.exe',
-            'MapleStory\MapleStory.exe',
-            'Program Files\MapleStory\MapleStory.exe',
-            'Program Files (x86)\MapleStory\MapleStory.exe'
-        )) {
+        foreach ($relative in $knownRelativePaths) {
             $out.Add((Join-Path ($drive + '\') $relative))
         }
     }
@@ -197,7 +342,8 @@ function Resolve-MapleStoryPath {
     Write-Host ''
     Write-Host 'Multiple MapleStory installations found:' -ForegroundColor Cyan
     for ($i = 0; $i -lt $candidates.Count; $i++) {
-        Write-Host ('[{0}] {1}' -f ($i + 1),$candidates[$i])
+        $label = Get-MapleInstallLabel -Path $candidates[$i]
+        Write-Host ('[{0}] [{1}] {2}' -f ($i + 1),$label,$candidates[$i])
     }
 
     while ($true) {
