@@ -28,8 +28,9 @@ Verified so far:
 - immediate restoration of the original signed DLL
 - cleanup watcher architecture
 - local test case with NVIDIA GeForce RTX 4070 Ti + Intel UHD Graphics 770
+- end-to-end validation on two different `Gr2D_DX11.dll` builds with different compiler code generation, including a system with NVIDIA GeForce RTX 5080 + AMD Radeon(TM) Graphics
 
-The generalized "select any DXGI adapter index" backend still needs additional end-to-end testing on more systems and GPU combinations.
+The generalized "select any DXGI adapter index" backend has now passed end-to-end testing on two distinct DLL builds and two different GPU combinations. Broader compatibility across additional MapleStory regions/builds and hardware still needs more real-world testing.
 
 ## Why this exists
 
@@ -70,12 +71,6 @@ If multiple installations are found, the selection list adds a region/source hin
 - `MapleStory_GPU_Seletor.ps1` — main implementation
 - `tests/MapleStory_GPU_Seletor.Tests.ps1` — architecture / probe / dry-run regression checks
 
-## Permissions
-
-Before touching `Gr2D_DX11.dll`, the launcher runs a write-access preflight. It verifies that the current user can create, rename, and delete temporary files in the game/backup folders and can open the DLL for read/write access without changing its contents.
-
-If the MapleStory folder is protected (for example under some `Program Files` installs), the launcher fails before patching and explains the permission problem. The selector should normally run at the same privilege level as the user's login/launcher tool; installing the game in a user-writable folder avoids UAC/integrity-level mismatches.
-
 ## Runtime behavior
 
 The discovered MapleStory executable path is cached at:
@@ -100,7 +95,7 @@ The selector does not automatically elevate itself. If elevation is required, ru
 
 Designed for Windows 10/11 systems with DXGI 1.6 / `IDXGIFactory6::EnumAdapterByGpuPreference`.
 
-The current build expects MapleStory's `Gr2D_DX11.dll` to contain the adapter-selection signatures used by this test build. If the game updates and those signatures change, the script is designed to fail instead of blindly patching unknown bytes.
+The current build does not depend on one fixed `Gr2D_DX11.dll` hash or patch offset. It discovers the expected DXGI adapter-selection control-flow structure at runtime. If a future game update changes that structure enough that it cannot be identified uniquely, the script fails closed before writing patch bytes.
 
 ## Warning
 
@@ -111,17 +106,17 @@ Use it at your own risk.
 ## Testing
 
 ```powershell
-pwsh -NoProfile -File .\tests\MapleStory_GPU_Seletor.Tests.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\MapleStory_GPU_Seletor.Tests.ps1
 ```
 
 Probe only:
 
 ```powershell
-pwsh -NoProfile -File .\MapleStory_GPU_Seletor.ps1 -Mode Probe
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\MapleStory_GPU_Seletor.ps1 -Mode Probe
 ```
 
 Dry-run a selected GPU index without launching the game:
 
 ```powershell
-pwsh -NoProfile -File .\MapleStory_GPU_Seletor.ps1 -Mode DryRunPatch -GpuIndex 1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\MapleStory_GPU_Seletor.ps1 -Mode DryRunPatch -GpuIndex 1
 ```
