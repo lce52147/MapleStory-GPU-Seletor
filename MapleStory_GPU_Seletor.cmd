@@ -13,7 +13,7 @@ if not exist "%SCRIPT%" (
 
 where powershell.exe >nul 2>&1
 if "%errorlevel%"=="0" (
-    powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%"
+    powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" %*
 ) else (
     where pwsh.exe >nul 2>&1
     if not "%errorlevel%"=="0" (
@@ -21,7 +21,7 @@ if "%errorlevel%"=="0" (
         pause
         exit /b 3
     )
-    pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%"
+    pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" %*
 )
 
 set "RC=%errorlevel%"
